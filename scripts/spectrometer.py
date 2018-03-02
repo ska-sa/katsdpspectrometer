@@ -18,6 +18,7 @@ import enum
 import json
 import asyncio
 
+import numpy as np
 from aiokatcp import DeviceServer, Sensor
 import spead2
 import spead2.recv.asyncio
@@ -35,6 +36,49 @@ class Status(enum.Enum):
 
 def _warn_if_positive(value):
     return Sensor.Status.WARN if value > 0 else Sensor.Status.NOMINAL
+
+
+def channel_ordering(num_chans):
+    """Ordering of spectrometer channels in an ECP-64 SPEAD item.
+
+    Parameters
+    ----------
+    num_chans : int
+        Number of spectrometer channels
+
+    Returns
+    -------
+    spead_index_per_channel : array of int, shape (`num_chans`,)
+        Index into SPEAD item of each spectrometer channel, allowing i'th
+        channel to be accessed as `spead_data[spead_index_per_channel[i]]`
+    """
+    pairs = np.arange(num_chans).reshape(-1, 2)
+    first_half = pairs[:num_chans // 4]
+    second_half = pairs[num_chans // 4:]
+    return np.c_[first_half, second_half].ravel()
+
+
+def unpack_bits(x, partition):
+    """Extract a series of bit fields from an integer.
+
+    Parameters
+    ----------
+    x : uint
+        Unsigned integer to be interpreted as a series of bit fields
+    partition : sequence of int
+        Bit fields to extract from `x` as indicated by their size in bits,
+        with the last field ending at the LSB of `x` (as per ECP-64 document)
+
+    Returns
+    -------
+    fields : list of uint
+        The value of each bit field as an unsigned integer
+    """
+    out = []
+    for size in reversed(partition):  # Grab fields starting from LSB
+        out.append(x & ((1 << size) - 1))
+        x >>= size
+    return out[::-1]    # Put back into MSB-to-LSB order
 
 
 class SpectrometerServer(DeviceServer):
@@ -129,9 +173,15 @@ class SpectrometerServer(DeviceServer):
                                heap.received_length, heap.heap_length)
                 self._input_incomplete_sensor.value += 1
                 continue
-            updated = ig.update(heap)
-            if 'timestamp' in updated:
-                print(updated.keys())
+            new_items = ig.update(heap)
+            if 'timestamp' in new_items:
+                timestamp = ig['timestamp'].value
+                dig_id = ig['digitiser_id'].value
+                dig_status = ig['digitiser_status'].value
+                dig_serial, dig_type, receptor, pol = unpack_bits(dig_id, (24, 8, 14, 2))
+                saturation, nd_on = unpack_bits(dig_status, (8, 1))
+                stream = [s[5:] for s in new_items if s.startswith('data_')][0]
+                print(receptor, dig_serial, timestamp, nd_on, stream)
         self._input_heaps_sensor.value = 0
         self._input_dumps_sensor.value = 0
         self._status_sensor.value = Status.FINISHED
