@@ -129,7 +129,6 @@ class SpectrometerServer(DeviceServer):
         memory_pool = spead2.MemoryPool(heap_size, heap_size + 4096,
                                         n_memory_buffers, n_memory_buffers)
         self.rx.set_memory_pool(memory_pool)
-        self.rx.stop_on_stop_item = False
         for stream in self._streams.values():
             endpoint = katsdptelstate.endpoint.endpoint_parser(7150)(stream)
             for port_offset in range(4):
@@ -144,7 +143,6 @@ class SpectrometerServer(DeviceServer):
                                            buffer_size=heap_size + 4096)
 
     async def do_capture(self):
-        n_stops = 0
         self._status_sensor.set_value(Status.WAIT_DATA)
         logger.info('Waiting for data...')
         ig = spead2.ItemGroup()
@@ -158,16 +156,7 @@ class SpectrometerServer(DeviceServer):
                 logger.info('First spectrometer heap received...')
                 self._status_sensor.set_value(Status.CAPTURING)
                 first = False
-            if heap.is_end_of_stream():
-                n_stops += 1
-                logger.debug("%d/%d spectrometer streams stopped",
-                             n_stops, len(self._streams))
-                if n_stops >= len(self._streams):
-                    self.rx.stop()
-                    break
-                else:
-                    continue
-            elif isinstance(heap, spead2.recv.IncompleteHeap):
+            if isinstance(heap, spead2.recv.IncompleteHeap):
                 logger.warning('Dropped incomplete heap %d (received '
                                '%d/%d bytes of payload)', heap.cnt,
                                heap.received_length, heap.heap_length)

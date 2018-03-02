@@ -30,7 +30,7 @@ setup(
         'katsdptelstate',
         'katsdpservices',
         'numpy',
-        'spead2>=1.5.0',     # For stop_on_stop_item
+        'spead2',
     ],
     use_katversion=True
 )
