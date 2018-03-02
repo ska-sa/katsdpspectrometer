@@ -107,7 +107,7 @@ class SpectrometerServer(DeviceServer):
         first = True
         while True:
             try:
-                heap = yield from self.rx.get()
+                heap = await self.rx.get()
             except spead2.Stopped:
                 break
             if first:
