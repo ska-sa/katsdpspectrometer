@@ -38,23 +38,23 @@ def _warn_if_positive(value):
     return Sensor.Status.WARN if value > 0 else Sensor.Status.NOMINAL
 
 
-def channel_ordering(num_chans):
+def channel_ordering(n_chans):
     """Ordering of spectrometer channels in an ECP-64 SPEAD item.
 
     Parameters
     ----------
-    num_chans : int
+    n_chans : int
         Number of spectrometer channels
 
     Returns
     -------
-    spead_index_per_channel : array of int, shape (`num_chans`,)
+    spead_index_per_channel : array of int, shape (`n_chans`,)
         Index into SPEAD item of each spectrometer channel, allowing i'th
         channel to be accessed as `spead_data[spead_index_per_channel[i]]`
     """
-    pairs = np.arange(num_chans).reshape(-1, 2)
-    first_half = pairs[:num_chans // 4]
-    second_half = pairs[num_chans // 4:]
+    pairs = np.arange(n_chans).reshape(-1, 2)
+    first_half = pairs[:n_chans // 4]
+    second_half = pairs[n_chans // 4:]
     return np.c_[first_half, second_half].ravel()
 
 
@@ -89,8 +89,6 @@ class SpectrometerServer(DeviceServer):
                  telstate, output_stream_name):
         self._telstate = telstate
         self._streams = input_streams
-        self._interface_address = katsdpservices.get_interface_address(
-            input_interface)
 
         self._build_state_sensor = Sensor(
             str, 'build-state', 'SDP Spectrometer build state',
@@ -121,22 +119,23 @@ class SpectrometerServer(DeviceServer):
 
         n_heaps_per_dump = 3 * len(self._streams)
         self.rx = spead2.recv.asyncio.Stream(
-            spead2.ThreadPool(), max_heaps=2 * n_heaps_per_dump,
-            ring_heaps=2 * n_heaps_per_dump, contiguous_only=False)
+            spead2.ThreadPool(), max_heaps=20 * n_heaps_per_dump,
+            ring_heaps=20 * n_heaps_per_dump, contiguous_only=False)
 
-        n_memory_buffers = 8 * n_heaps_per_dump
+        n_memory_buffers = 80 * n_heaps_per_dump
         heap_size = 2 * 128 * 4 + 64
         memory_pool = spead2.MemoryPool(heap_size, heap_size + 4096,
                                         n_memory_buffers, n_memory_buffers)
         self.rx.set_memory_pool(memory_pool)
+        interface_address = katsdpservices.get_interface_address(input_interface)
         for stream in self._streams.values():
             endpoint = katsdptelstate.endpoint.endpoint_parser(7150)(stream)
             for port_offset in range(4):
-                if self._interface_address is not None:
+                if interface_address is not None:
                     self.rx.add_udp_reader(
                         endpoint.host, endpoint.port + port_offset,
                         buffer_size=heap_size + 4096,
-                        interface_address=self._interface_address)
+                        interface_address=interface_address)
                 else:
                     self.rx.add_udp_reader(endpoint.port + port_offset,
                                            bind_hostname=endpoint.host,
@@ -146,31 +145,34 @@ class SpectrometerServer(DeviceServer):
         self._status_sensor.set_value(Status.WAIT_DATA)
         logger.info('Waiting for data...')
         ig = spead2.ItemGroup()
-        first = True
+        no_heaps_yet = True
         while True:
             try:
                 heap = await self.rx.get()
             except spead2.Stopped:
                 break
-            if first:
-                logger.info('First spectrometer heap received...')
-                self._status_sensor.set_value(Status.CAPTURING)
-                first = False
             if isinstance(heap, spead2.recv.IncompleteHeap):
                 logger.warning('Dropped incomplete heap %d (received '
                                '%d/%d bytes of payload)', heap.cnt,
                                heap.received_length, heap.heap_length)
                 self._input_incomplete_sensor.value += 1
                 continue
+            if no_heaps_yet:
+                logger.info('First spectrometer heap received...')
+                self._status_sensor.set_value(Status.CAPTURING)
+                no_heaps_yet = False
             new_items = ig.update(heap)
-            if 'timestamp' in new_items:
-                timestamp = ig['timestamp'].value
-                dig_id = ig['digitiser_id'].value
-                dig_status = ig['digitiser_status'].value
-                dig_serial, dig_type, receptor, pol = unpack_bits(dig_id, (24, 8, 14, 2))
-                saturation, nd_on = unpack_bits(dig_status, (8, 1))
-                stream = [s[5:] for s in new_items if s.startswith('data_')][0]
-                print(receptor, dig_serial, timestamp, nd_on, stream)
+            # If SPEAD descriptors have not arrived yet, keep waiting
+            if 'timestamp' not in new_items:
+                continue
+            timestamp = ig['timestamp'].value
+            dig_id = ig['digitiser_id'].value
+            dig_status = ig['digitiser_status'].value
+            dig_serial, dig_type, receptor, pol = unpack_bits(dig_id,
+                                                              (24, 8, 14, 2))
+            saturation, nd_on = unpack_bits(dig_status, (8, 1))
+            stream = [s[5:] for s in new_items if s.startswith('data_')][0]
+            print(receptor, dig_serial, timestamp, nd_on, stream)
         self._input_heaps_sensor.value = 0
         self._input_dumps_sensor.value = 0
         self._status_sensor.value = Status.FINISHED
