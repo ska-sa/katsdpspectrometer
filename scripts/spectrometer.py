@@ -67,16 +67,16 @@ def unpack_bits(x, partition):
 
     Parameters
     ----------
-    x : uint
-        Unsigned integer to be interpreted as a series of bit fields
+    x : uint or positive int
+        Unsigned / positive integer to be interpreted as a series of bit fields
     partition : sequence of int
         Bit fields to extract from `x` as indicated by their size in bits,
         with the last field ending at the LSB of `x` (as per ECP-64 document)
 
     Returns
     -------
-    fields : list of uint
-        The value of each bit field as an unsigned integer
+    fields : list of uint or positive int
+        The value of each bit field as an unsigned / positive integer
     """
     out = []
     for size in reversed(partition):  # Grab fields starting from LSB
@@ -153,7 +153,7 @@ class SpectrometerServer(DeviceServer):
         """"""
         if stream not in ('hh', 'vv') or len(heaps) < 3:
             return
-        nd_on = [heap.nd_on for heap in heaps[-3:]]
+        nd_on = [heap.nd_on for heap in heaps]
         if nd_on not in ([0, 1, 0], [1, 0, 1]):
             return
         timestamps = [heap.timestamp for heap in heaps]
@@ -195,9 +195,9 @@ class SpectrometerServer(DeviceServer):
             # If SPEAD descriptors have not arrived yet, keep waiting
             if 'timestamp' not in new_items:
                 continue
-            timestamp = ig['timestamp'].value
-            dig_id = ig['digitiser_id'].value
-            dig_status = ig['digitiser_status'].value
+            timestamp = int(ig['timestamp'].value)
+            dig_id = int(ig['digitiser_id'].value)
+            dig_status = int(ig['digitiser_status'].value)
             dig_serial, dig_type, receptor, pol = unpack_bits(dig_id,
                                                               (24, 8, 14, 2))
             saturation, nd_on = unpack_bits(dig_status, (8, 1))
@@ -210,8 +210,8 @@ class SpectrometerServer(DeviceServer):
                 data = ig['data_' + stream].value[chans]
             key = (receptor, stream)
             heaps = previous_heaps.get(key, [])
-            heaps.append(HeapData(timestamp, int(nd_on), data))
-            self.calculate_gains(receptor, stream, heaps)
+            heaps.append(HeapData(timestamp, nd_on, data))
+            self.calculate_gains(receptor, stream, heaps[-3:])
             previous_heaps[key] = heaps[-2:]
             print(receptor, dig_serial, stream, timestamp, nd_on)
         self._input_heaps_sensor.value = 0
