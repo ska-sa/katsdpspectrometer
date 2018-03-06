@@ -17,6 +17,7 @@ import signal
 import enum
 import json
 import asyncio
+from collections import namedtuple
 
 import numpy as np
 from aiokatcp import DeviceServer, Sensor
@@ -34,7 +35,10 @@ class Status(enum.Enum):
     FINISHED = 4
 
 
-def _warn_if_positive(value):
+HeapData = namedtuple('HeapData', 'timestamp nd_on data')
+
+
+def warn_if_positive(value):
     return Sensor.Status.WARN if value > 0 else Sensor.Status.NOMINAL
 
 
@@ -87,9 +91,16 @@ class SpectrometerServer(DeviceServer):
 
     def __init__(self, host, port, loop, input_streams, input_interface,
                  telstate, output_stream_name):
+        super().__init__(host, port, loop=loop)
         self._telstate = telstate
         self._streams = input_streams
+        # XXX Hack to get relevant digitiser metadata
+        self._sync_time = telstate['i0_sync_time']
+        self._scale_factor_timestamp = telstate['i0_scale_factor_timestamp']
+        self._n_chans = 128
+        self._outputs = {}
 
+        # Set up KATCP sensors
         self._build_state_sensor = Sensor(
             str, 'build-state', 'SDP Spectrometer build state',
             default=self.BUILD_STATE)
@@ -107,23 +118,20 @@ class SpectrometerServer(DeviceServer):
         self._input_incomplete_sensor = Sensor(
             int, 'input-incomplete-total',
             'Number of heaps dropped due to being incomplete',
-            default=0, status_func=_warn_if_positive)
-
-        super().__init__(host, port, loop=loop)
-
+            default=0, status_func=warn_if_positive)
         self.sensors.add(self._build_state_sensor)
         self.sensors.add(self._status_sensor)
         self.sensors.add(self._input_heaps_sensor)
         self.sensors.add(self._input_dumps_sensor)
         self.sensors.add(self._input_incomplete_sensor)
 
+        # Set up SPEAD receiver and listen to input streams
         n_heaps_per_dump = 3 * len(self._streams)
         self.rx = spead2.recv.asyncio.Stream(
             spead2.ThreadPool(), max_heaps=20 * n_heaps_per_dump,
             ring_heaps=20 * n_heaps_per_dump, contiguous_only=False)
-
         n_memory_buffers = 80 * n_heaps_per_dump
-        heap_size = 2 * 128 * 4 + 64
+        heap_size = 2 * self._n_chans * 4 + 64
         memory_pool = spead2.MemoryPool(heap_size, heap_size + 4096,
                                         n_memory_buffers, n_memory_buffers)
         self.rx.set_memory_pool(memory_pool)
@@ -141,11 +149,33 @@ class SpectrometerServer(DeviceServer):
                                            bind_hostname=endpoint.host,
                                            buffer_size=heap_size + 4096)
 
+    def calculate_gains(self, receptor, stream, heaps):
+        """"""
+        if stream not in ('hh', 'vv') or len(heaps) < 3:
+            return
+        nd_on = [heap.nd_on for heap in heaps[-3:]]
+        if nd_on not in ([0, 1, 0], [1, 0, 1]):
+            return
+        timestamps = [heap.timestamp for heap in heaps]
+        accums = np.diff(timestamps) / (2.0 * self._n_chans)
+        power = np.vstack([heap.data for heap in heaps[:2]]).T / accums
+        delta = power[:, nd_on[1]] - power[:, nd_on[0]]
+        noise_diode_model = 20.
+        gain = np.median(delta / noise_diode_model)
+        timestamp = (self._sync_time +
+                     timestamps[1] / self._scale_factor_timestamp)
+        key = (receptor, 'gain_' + stream)
+        outputs = self._outputs.get(key, [])
+        outputs.append(np.array([timestamp, gain]))
+        self._outputs[key] = outputs
+
     async def do_capture(self):
         self._status_sensor.set_value(Status.WAIT_DATA)
         logger.info('Waiting for data...')
         ig = spead2.ItemGroup()
         no_heaps_yet = True
+        previous_heaps = {}
+        chans = channel_ordering(self._n_chans)
         while True:
             try:
                 heap = await self.rx.get()
@@ -172,7 +202,18 @@ class SpectrometerServer(DeviceServer):
                                                               (24, 8, 14, 2))
             saturation, nd_on = unpack_bits(dig_status, (8, 1))
             stream = [s[5:] for s in new_items if s.startswith('data_')][0]
-            print(receptor, dig_serial, timestamp, nd_on, stream)
+            if stream == 'vh':
+                revh = ig['data_' + stream].value[:self._n_chans][chans]
+                imvh = ig['data_' + stream].value[self._n_chans:][chans]
+                data = np.vstack((revh, imvh))
+            else:
+                data = ig['data_' + stream].value[chans]
+            key = (receptor, stream)
+            heaps = previous_heaps.get(key, [])
+            heaps.append(HeapData(timestamp, int(nd_on), data))
+            self.calculate_gains(receptor, stream, heaps)
+            previous_heaps[key] = heaps[-2:]
+            print(receptor, dig_serial, stream, timestamp, nd_on)
         self._input_heaps_sensor.value = 0
         self._input_dumps_sensor.value = 0
         self._status_sensor.value = Status.FINISHED
