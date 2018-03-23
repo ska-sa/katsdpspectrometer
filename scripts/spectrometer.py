@@ -287,8 +287,9 @@ class SpectrometerServer(DeviceServer):
         self._telstate = self._telstate.view(output_capture_stream)
         l0_capture_stream = self._telstate.SEPARATOR.join(
             (capture_block_id, self._l0_stream_name))
+        l0_telstate = self._telstate.view(self._l0_stream_name)
         cb_l0_telstate = self._telstate.view(l0_capture_stream)
-        self._l0_dump_end = (cb_l0_telstate['sync_time'] +
+        self._l0_dump_end = (l0_telstate['sync_time'] +
                              cb_l0_telstate['first_timestamp'] +
                              0.5 * self._l0_int_time)
 
