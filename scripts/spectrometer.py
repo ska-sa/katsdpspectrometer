@@ -178,14 +178,16 @@ class SpectrometerServer(DeviceServer):
         n_pols = len(POL_ORDERING)
         products = {'gain': np.full((n_pols, n_receptors), np.nan),
                     'tsys': np.full((n_pols, n_receptors), np.nan)}
-        dig_serial = [-1] * n_receptors
-        for (receptor_number, stream), stream_heaps in heaps:
+        dig_serial = [0] * n_receptors
+        for (receptor_number, stream), stream_heaps in heaps.items():
             receptor_index = receptor_lookup[receptor_number]
             if stream_heaps:
                 dig_serial[receptor_index] = stream_heaps[0].dig_serial
             dump_heaps = sorted([heap for heap in stream_heaps
                                  if heap.timestamp >= l0_dump_start and
                                  heap.timestamp < self._l0_dump_end])
+            if not dump_heaps:
+                continue
             timestamps = np.array([heap.timestamp for heap in dump_heaps])
             nd_on = np.array([heap.nd_on for heap in dump_heaps])
             data = np.vstack([h.data[np.newaxis] for h in dump_heaps])
@@ -211,7 +213,7 @@ class SpectrometerServer(DeviceServer):
         l0_timestamp = self._l0_dump_end - 0.5 * self._l0_int_time
         for key, value in products.items():
             self._telstate.add(key, value, l0_timestamp)
-        if 'dig_serial' not in self._telstate:
+        if 'dig_serial' not in self._telstate and any(dig_serial):
             stream_telstate = self._telstate.view(self._output_stream_name)
             stream_telstate.add('dig_serial_number', dig_serial, immutable=True)
 
