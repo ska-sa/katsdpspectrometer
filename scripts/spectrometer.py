@@ -28,6 +28,17 @@ import katsdpservices
 import katsdpspectrometer
 
 
+# Time after end of L0 dump when all associated spectrometer heaps are deemed
+# to be received, in seconds
+SETTLE_TIME = 1.0
+
+# Basic noise diode model, as a temperature in K
+NOISE_DIODE_MODEL = 20.0
+
+# Ordering of polarisations in output products
+POL_ORDERING = ['v', 'h']
+
+
 class Status(enum.Enum):
     IDLE = 1
     WAIT_DATA = 2
@@ -35,7 +46,7 @@ class Status(enum.Enum):
     FINISHED = 4
 
 
-HeapData = namedtuple('HeapData', 'timestamp nd_on data')
+HeapData = namedtuple('HeapData', 'timestamp nd_on dig_serial data')
 
 
 def warn_if_positive(value):
@@ -90,15 +101,17 @@ class SpectrometerServer(DeviceServer):
     BUILD_STATE = 'katsdpspectrometer-' + katsdpspectrometer.__version__
 
     def __init__(self, host, port, loop, input_streams, input_interface,
-                 telstate, output_stream_name):
+                 telstate, l0_stream_name, output_stream_name):
         super().__init__(host, port, loop=loop)
-        self._telstate = telstate
         self._streams = input_streams
-        # XXX Hack to get relevant digitiser metadata
-        self._sync_time = telstate['i0_sync_time']
-        self._scale_factor_timestamp = telstate['i0_scale_factor_timestamp']
+        self._l0_stream_name = l0_stream_name
+        self._output_stream_name = output_stream_name
+        self._telstate = telstate.view(output_stream_name)
+        # XXX Hack to get relevant digitiser timestamp metadata
+        self._dig_time_scale = self._telstate['i0_scale_factor_timestamp']
+        self._l0_int_time = telstate.view(l0_stream_name)['int_time']
+        self._l0_dump_end = None
         self._n_chans = 128
-        self._outputs = {}
 
         # Set up KATCP sensors
         self._build_state_sensor = Sensor(
@@ -148,34 +161,70 @@ class SpectrometerServer(DeviceServer):
                     self.rx.add_udp_reader(endpoint.port + port_offset,
                                            bind_hostname=endpoint.host,
                                            buffer_size=heap_size + 4096)
+        # Put stream metadata into telstate in the top-level stream namespace
+        self._telstate.add('receptors', sorted(self._streams), immutable=True)
+        self._telstate.add('pols', POL_ORDERING, immutable=True)
+        self._telstate.add('n_chans', self._n_chans, immutable=True)
+        # XXX What do you mean it's not L-band???
+        self._telstate.add('center_freq', 1284e6, immutable=True)
+        self._telstate.add('bandwidth', 856e6, immutable=True)
 
-    def calculate_gains(self, receptor, stream, heaps):
-        """"""
-        if stream not in ('hh', 'vv') or len(heaps) < 3:
-            return
-        nd_on = [heap.nd_on for heap in heaps]
-        if nd_on not in ([0, 1, 0], [1, 0, 1]):
-            return
-        timestamps = [heap.timestamp for heap in heaps]
-        accums = np.diff(timestamps) / (2.0 * self._n_chans)
-        power = np.vstack([heap.data for heap in heaps[:2]]).T / accums
-        delta = power[:, nd_on[1]] - power[:, nd_on[0]]
-        noise_diode_model = 20.
-        gain = np.median(delta / noise_diode_model)
-        timestamp = (self._sync_time +
-                     timestamps[1] / self._scale_factor_timestamp)
-        key = (receptor, 'gain_' + stream)
-        outputs = self._outputs.get(key, [])
-        outputs.append(np.array([timestamp, gain]))
-        self._outputs[key] = outputs
+    def process_l0_dump(self, heaps):
+        """Turn an L0 dump worth of heaps into spectrometer products."""
+        l0_dump_start = self._l0_dump_end - self._l0_int_time
+        receptor_lookup = {int(rcp_name[1:]): n
+                           for n, rcp_name in enumerate(sorted(self._streams))}
+        n_receptors = len(receptor_lookup)
+        n_pols = len(POL_ORDERING)
+        products = {'gain': np.full((n_pols, n_receptors), np.nan),
+                    'tsys': np.full((n_pols, n_receptors), np.nan)}
+        dig_serial = [-1] * n_receptors
+        for (receptor_number, stream), stream_heaps in heaps:
+            receptor_index = receptor_lookup[receptor_number]
+            if stream_heaps:
+                dig_serial[receptor_index] = stream_heaps[0].dig_serial
+            dump_heaps = sorted([heap for heap in stream_heaps
+                                 if heap.timestamp >= l0_dump_start and
+                                 heap.timestamp < self._l0_dump_end])
+            timestamps = np.array([heap.timestamp for heap in dump_heaps])
+            nd_on = np.array([heap.nd_on for heap in dump_heaps])
+            data = np.vstack([h.data[np.newaxis] for h in dump_heaps])
+            on = np.where(nd_on == 1)[0]
+            off = np.where(nd_on == 0)[0]
+            if min(len(on), len(off)) < 8:
+                continue
+            intervals = np.r_[np.diff(timestamps), np.inf]
+            on_time = min(intervals[on])
+            off_time = min(intervals[off])
+            on_accums = on_time * self._dig_time_scale / (2. * self._n_chans)
+            off_accums = off_time * self._dig_time_scale / (2. * self._n_chans)
+            mean_on = np.mean(data[on] / on_accums, axis=0)
+            mean_off = np.mean(data[off] / off_accums, axis=0)
+            delta = mean_on - mean_off
+            if stream in ('hh', 'vv'):
+                pol_index = POL_ORDERING.index(stream[0])
+                power_gain = delta.sum() / NOISE_DIODE_MODEL
+                voltage_gain = np.sqrt(power_gain)
+                tsys = mean_off.sum() / power_gain
+                products['gain'][pol_index, receptor_index] = voltage_gain
+                products['tsys'][pol_index, receptor_index] = tsys
+        l0_timestamp = self._l0_dump_end - 0.5 * self._l0_int_time
+        for key, value in products.items():
+            self._telstate.add(key, value, l0_timestamp)
+        if 'dig_serial' not in self._telstate:
+            stream_telstate = self._telstate.view(self._output_stream_name)
+            stream_telstate.add('dig_serial_number', dig_serial, immutable=True)
 
     async def do_capture(self):
+        """Receive SPEAD heaps from digitisers while the subarray is up."""
         self._status_sensor.set_value(Status.WAIT_DATA)
         logger.info('Waiting for data...')
         ig = spead2.ItemGroup()
         no_heaps_yet = True
-        previous_heaps = {}
         chans = channel_ordering(self._n_chans)
+        heaps = {}
+        # XXX Hack to get relevant digitiser timestamp metadata
+        dig_sync_time = self._telstate['i0_sync_time']
         while True:
             try:
                 heap = await self.rx.get()
@@ -195,11 +244,13 @@ class SpectrometerServer(DeviceServer):
             # If SPEAD descriptors have not arrived yet, keep waiting
             if 'timestamp' not in new_items:
                 continue
-            timestamp = int(ig['timestamp'].value)
+            # Extract the relevant items from spectrometer heap
+            adc_timestamp = int(ig['timestamp'].value)
+            timestamp = dig_sync_time + adc_timestamp / self._dig_time_scale
             dig_id = int(ig['digitiser_id'].value)
             dig_status = int(ig['digitiser_status'].value)
-            dig_serial, dig_type, receptor, pol = unpack_bits(dig_id,
-                                                              (24, 8, 14, 2))
+            id_fields = unpack_bits(dig_id, (24, 8, 14, 2))
+            dig_serial, dig_type, receptor_number, pol = id_fields
             saturation, nd_on = unpack_bits(dig_status, (8, 1))
             stream = [s[5:] for s in new_items if s.startswith('data_')][0]
             if stream == 'vh':
@@ -208,15 +259,43 @@ class SpectrometerServer(DeviceServer):
                 data = np.vstack((revh, imvh))
             else:
                 data = ig['data_' + stream].value[chans]
-            key = (receptor, stream)
-            heaps = previous_heaps.get(key, [])
-            heaps.append(HeapData(timestamp, nd_on, data))
-            self.calculate_gains(receptor, stream, heaps[-3:])
-            previous_heaps[key] = heaps[-2:]
-            print(receptor, dig_serial, stream, timestamp, nd_on)
+            # Put new heap onto the queue of recent heaps
+            key = (receptor_number, stream)
+            stream_heaps = heaps.get(key, [])
+            stream_heaps.append(HeapData(timestamp, nd_on, dig_serial, data))
+            heaps[key] = stream_heaps
+            # While not capturing correlator data, keep sliding window of heaps
+            if self._l0_dump_end is None:
+                cutoff = timestamp - self._l0_int_time - 1.1 * SETTLE_TIME
+                heaps[key] = [h for h in stream_heaps if h.timestamp >= cutoff]
+                continue
+            # Batch process an entire L0 dump some time after the dump
+            if timestamp > self._l0_dump_end + SETTLE_TIME:
+                self.process_l0_dump(heaps)
+                for key in heaps:
+                    heaps[key] = [heap for heap in heaps[key]
+                                  if heap.timestamp >= self._l0_dump_end]
+                self._l0_dump_end += self._l0_int_time
         self._input_heaps_sensor.value = 0
         self._input_dumps_sensor.value = 0
         self._status_sensor.value = Status.FINISHED
+
+    async def request_capture_init(self, ctx, capture_block_id: str) -> None:
+        """Start a capture block, triggering spectrometer output to telstate."""
+        output_capture_stream = self._telstate.SEPARATOR.join(
+            (capture_block_id, self._output_stream_name))
+        self._telstate = self._telstate.view(output_capture_stream)
+        l0_capture_stream = self._telstate.SEPARATOR.join(
+            (capture_block_id, self._l0_stream_name))
+        cb_l0_telstate = self._telstate.view(l0_capture_stream)
+        self._l0_dump_end = (cb_l0_telstate['sync_time'] +
+                             cb_l0_telstate['first_timestamp'] +
+                             0.5 * self._l0_int_time)
+
+    async def request_capture_done(self, ctx, capture_block_id: str) -> None:
+        """Stop capture block, , flush final spectrometer dump and stop output."""
+        self._telstate = self._telstate.root().view(self._output_stream_name)
+        self._l0_dump_end = None
 
 
 def on_shutdown(loop, server):
@@ -246,6 +325,9 @@ if __name__ == '__main__':
     parser.add_argument('--input-interface', metavar='INTERFACE',
                         help='Network interface to subscribe to for '
                              'spectrometer streams [default=auto]')
+    parser.add_argument('--l0-stream-name', default='sdp_l0',
+                        help='Name of the associated SDP L0 stream',
+                        metavar='NAME')
     parser.add_argument('--output-stream-name', default='sdp_spectrometer',
                         help='Telstate name of the spectrometer output stream',
                         metavar='NAME')
@@ -258,7 +340,7 @@ if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     server = SpectrometerServer(args.host, args.port, loop, args.input_streams,
                                 args.input_interface, args.telstate,
-                                args.output_stream_name)
+                                args.l0_stream_name, args.output_stream_name)
     logger.info("Started digitiser spectrometer server")
     loop.run_until_complete(run(loop, server))
     loop.close()
