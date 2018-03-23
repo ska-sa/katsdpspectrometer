@@ -32,6 +32,9 @@ import katsdpspectrometer
 # to be received, in seconds
 SETTLE_TIME = 1.0
 
+# Number of frequency channels in spectrometer (currently fixed for L-band)
+N_CHANS = 128
+
 # Basic noise diode model, as a temperature in K
 NOISE_DIODE_MODEL = 20.0
 
@@ -111,7 +114,6 @@ class SpectrometerServer(DeviceServer):
         self._dig_time_scale = self._telstate['i0_scale_factor_timestamp']
         self._l0_int_time = telstate.view(l0_stream_name)['int_time']
         self._l0_dump_end = None
-        self._n_chans = 128
 
         # Set up KATCP sensors
         self._build_state_sensor = Sensor(
@@ -144,7 +146,7 @@ class SpectrometerServer(DeviceServer):
             spead2.ThreadPool(), max_heaps=20 * n_heaps_per_dump,
             ring_heaps=20 * n_heaps_per_dump, contiguous_only=False)
         n_memory_buffers = 80 * n_heaps_per_dump
-        heap_size = 2 * self._n_chans * 4 + 64
+        heap_size = 2 * N_CHANS * 4 + 64
         memory_pool = spead2.MemoryPool(heap_size, heap_size + 4096,
                                         n_memory_buffers, n_memory_buffers)
         self.rx.set_memory_pool(memory_pool)
@@ -164,7 +166,7 @@ class SpectrometerServer(DeviceServer):
         # Put stream metadata into telstate in the top-level stream namespace
         self._telstate.add('receptors', sorted(self._streams), immutable=True)
         self._telstate.add('pols', POL_ORDERING, immutable=True)
-        self._telstate.add('n_chans', self._n_chans, immutable=True)
+        self._telstate.add('n_chans', N_CHANS, immutable=True)
         # XXX What do you mean it's not L-band???
         self._telstate.add('center_freq', 1284e6, immutable=True)
         self._telstate.add('bandwidth', 856e6, immutable=True)
@@ -190,7 +192,7 @@ class SpectrometerServer(DeviceServer):
                 continue
             timestamps = np.array([heap.timestamp for heap in dump_heaps])
             nd_on = np.array([heap.nd_on for heap in dump_heaps])
-            data = np.vstack([h.data[np.newaxis] for h in dump_heaps])
+            data = np.vstack([heap.data[np.newaxis] for heap in dump_heaps])
             on = np.where(nd_on == 1)[0]
             off = np.where(nd_on == 0)[0]
             if min(len(on), len(off)) < 8:
@@ -198,16 +200,16 @@ class SpectrometerServer(DeviceServer):
             intervals = np.r_[np.diff(timestamps), np.inf]
             on_time = min(intervals[on])
             off_time = min(intervals[off])
-            on_accums = on_time * self._dig_time_scale / (2. * self._n_chans)
-            off_accums = off_time * self._dig_time_scale / (2. * self._n_chans)
-            mean_on = np.mean(data[on] / on_accums, axis=0)
-            mean_off = np.mean(data[off] / off_accums, axis=0)
-            delta = mean_on - mean_off
+            on_accums = on_time * self._dig_time_scale / (2. * N_CHANS)
+            off_accums = off_time * self._dig_time_scale / (2. * N_CHANS)
+            data_on = data[on] / on_accums
+            data_off = data[off] / off_accums
+            delta = data_on - data_off
             if stream in ('hh', 'vv'):
                 pol_index = POL_ORDERING.index(stream[0])
-                power_gain = delta.sum() / NOISE_DIODE_MODEL
+                power_gain = N_CHANS * np.median(delta) / NOISE_DIODE_MODEL
                 voltage_gain = np.sqrt(power_gain)
-                tsys = mean_off.sum() / power_gain
+                tsys = N_CHANS * data_off.mean() / power_gain
                 products['gain'][pol_index, receptor_index] = voltage_gain
                 products['tsys'][pol_index, receptor_index] = tsys
         l0_timestamp = self._l0_dump_end - 0.5 * self._l0_int_time
@@ -223,7 +225,7 @@ class SpectrometerServer(DeviceServer):
         logger.info('Waiting for data...')
         ig = spead2.ItemGroup()
         no_heaps_yet = True
-        chans = channel_ordering(self._n_chans)
+        chans = channel_ordering(N_CHANS)
         heaps = {}
         # XXX Hack to get relevant digitiser timestamp metadata
         dig_sync_time = self._telstate['i0_sync_time']
@@ -256,8 +258,8 @@ class SpectrometerServer(DeviceServer):
             saturation, nd_on = unpack_bits(dig_status, (8, 1))
             stream = [s[5:] for s in new_items if s.startswith('data_')][0]
             if stream == 'vh':
-                revh = ig['data_' + stream].value[:self._n_chans][chans]
-                imvh = ig['data_' + stream].value[self._n_chans:][chans]
+                revh = ig['data_' + stream].value[:N_CHANS][chans]
+                imvh = ig['data_' + stream].value[N_CHANS:][chans]
                 data = np.vstack((revh, imvh))
             else:
                 data = ig['data_' + stream].value[chans]
