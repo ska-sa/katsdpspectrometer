@@ -189,6 +189,9 @@ class SpectrometerServer(DeviceServer):
     def process_l0_dump(self, heaps):
         """Turn an L0 dump worth of heaps into spectrometer products."""
         l0_dump_start = self._l0_dump_end - self._l0_int_time
+        l0_timestamp = self._l0_dump_end - 0.5 * self._l0_int_time
+        logger.info('Dump %.3f, %d streams, %d heaps', l0_timestamp,
+                    len(heaps), sum([len(v) for v in heaps.values()]))
         receptor_lookup = {int(rcp_name[1:]): n
                            for n, rcp_name in enumerate(sorted(self._streams))}
         n_receptors = len(receptor_lookup)
@@ -198,7 +201,7 @@ class SpectrometerServer(DeviceServer):
                     'tsys': np.full((n_pols, n_receptors), np.nan),
                     'nd_power': np.full((n_pols, n_receptors, n_coefs), np.nan,
                                         dtype=np.float16),
-                    'nd_phase': np.full((n_receptors, n_coefs), np.nan,
+                    'nd_phase': np.full((2, n_receptors, n_coefs), np.nan,
                                         dtype=np.float16)}
         dig_serial = [0] * n_receptors
         chans = np.arange(N_CHANS, dtype=float)
@@ -239,21 +242,22 @@ class SpectrometerServer(DeviceServer):
                 coefs = tck[1][:n_coefs]
                 products['nd_power'][pol_index, receptor_index] = coefs
             else:
-                revh, imvh = delta
-                std_revh, std_imvh = std_delta
-                vh_phase = np.arctan2(imvh, revh)
-                # A rough estimate of the phase stdev using the VH mean as
-                # the radius of the phase angle
-                std_vh_phase = (np.sqrt(std_revh ** 2 + std_imvh ** 2) /
-                                np.sqrt(revh ** 2 + imvh ** 2))
-                tck = interpolate.splrep(chans, vh_phase, 1. / std_vh_phase,
+                # Channel 0 in FFT is always real, hence stdev of imag part = 0
+                # Replace it with massive stdev instead to ignore data point
+                std_delta[1, 0] = 100. * std_delta[1].max()
+                # Real part of crosscorrelation product VH*
+                tck = interpolate.splrep(chans, delta[0], 1. / std_delta[0],
                                          k=SPLINE_ORDER, t=self._knots)
                 coefs = tck[1][:n_coefs]
-                products['nd_phase'][receptor_index] = coefs
-        l0_timestamp = self._l0_dump_end - 0.5 * self._l0_int_time
+                products['nd_phase'][0, receptor_index] = coefs
+                # Imaginary part of crosscorrelation product VH*
+                tck = interpolate.splrep(chans, delta[1], 1. / std_delta[1],
+                                         k=SPLINE_ORDER, t=self._knots)
+                coefs = tck[1][:n_coefs]
+                products['nd_phase'][1, receptor_index] = coefs
         for key, value in products.items():
             self._telstate.add(key, value, l0_timestamp)
-        if 'dig_serial' not in self._telstate and any(dig_serial):
+        if 'dig_serial_number' not in self._telstate and any(dig_serial):
             stream_telstate = self._telstate.view(self._output_stream_name)
             stream_telstate.add('dig_serial_number', dig_serial, immutable=True)
 
@@ -334,11 +338,13 @@ class SpectrometerServer(DeviceServer):
         self._l0_dump_end = (l0_telstate['sync_time'] +
                              cb_l0_telstate['first_timestamp'] +
                              0.5 * self._l0_int_time)
+        logger.info('Init capture block %s', capture_block_id)
 
     async def request_capture_done(self, ctx, capture_block_id: str) -> None:
         """Stop capture block, , flush final spectrometer dump and stop output."""
         self._telstate = self._telstate.root().view(self._output_stream_name)
         self._l0_dump_end = None
+        logger.info('Done with capture block %s', capture_block_id)
 
 
 def on_shutdown(loop, server):
