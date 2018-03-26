@@ -20,6 +20,7 @@ import asyncio
 from collections import namedtuple
 
 import numpy as np
+import scipy.interpolate as interpolate
 from aiokatcp import DeviceServer, Sensor
 import spead2
 import spead2.recv.asyncio
@@ -40,6 +41,13 @@ NOISE_DIODE_MODEL = 20.0
 
 # Ordering of polarisations in output products
 POL_ORDERING = ['v', 'h']
+
+# Number of knots in spline representation of noise diode power spectra
+# (used for "post-processing correction" of bandpass shapes)
+N_KNOTS = 17
+
+# Spline order used to fit noise diode power spectra
+SPLINE_ORDER = 3
 
 
 class Status(enum.Enum):
@@ -114,6 +122,12 @@ class SpectrometerServer(DeviceServer):
         self._dig_time_scale = self._telstate['i0_scale_factor_timestamp']
         self._l0_int_time = telstate.view(l0_stream_name)['int_time']
         self._l0_dump_end = None
+        # Generate uniform sequence of knots across spectrum for spline fits
+        self._knots = np.arange(N_KNOTS, dtype=float)
+        # Make them slightly denser at edges to get better model of roll-off
+        self._knots[0] += 0.5
+        self._knots[-1] -= 0.5
+        self._knots *= N_CHANS / (N_KNOTS - 1.0)
 
         # Set up KATCP sensors
         self._build_state_sensor = Sensor(
@@ -167,6 +181,7 @@ class SpectrometerServer(DeviceServer):
         self._telstate.add('receptors', sorted(self._streams), immutable=True)
         self._telstate.add('pols', POL_ORDERING, immutable=True)
         self._telstate.add('n_chans', N_CHANS, immutable=True)
+        self._telstate.add('knots', self._knots, immutable=True)
         # XXX What do you mean it's not L-band???
         self._telstate.add('center_freq', 1284e6, immutable=True)
         self._telstate.add('bandwidth', 856e6, immutable=True)
@@ -178,9 +193,15 @@ class SpectrometerServer(DeviceServer):
                            for n, rcp_name in enumerate(sorted(self._streams))}
         n_receptors = len(receptor_lookup)
         n_pols = len(POL_ORDERING)
+        n_coefs = len(self._knots) + SPLINE_ORDER + 1
         products = {'gain': np.full((n_pols, n_receptors), np.nan),
-                    'tsys': np.full((n_pols, n_receptors), np.nan)}
+                    'tsys': np.full((n_pols, n_receptors), np.nan),
+                    'nd_power': np.full((n_pols, n_receptors, n_coefs), np.nan,
+                                        dtype=np.float16),
+                    'nd_phase': np.full((n_receptors, n_coefs), np.nan,
+                                        dtype=np.float16)}
         dig_serial = [0] * n_receptors
+        chans = np.arange(N_CHANS, dtype=float)
         for (receptor_number, stream), stream_heaps in heaps.items():
             receptor_index = receptor_lookup[receptor_number]
             if stream_heaps:
@@ -204,7 +225,8 @@ class SpectrometerServer(DeviceServer):
             off_accums = off_time * self._dig_time_scale / (2. * N_CHANS)
             data_on = data[on] / on_accums
             data_off = data[off] / off_accums
-            delta = data_on - data_off
+            delta = data_on.mean(axis=0) - data_off.mean(axis=0)
+            std_delta = np.sqrt(data_on.var(axis=0) + data_off.var(axis=0))
             if stream in ('hh', 'vv'):
                 pol_index = POL_ORDERING.index(stream[0])
                 power_gain = N_CHANS * np.median(delta) / NOISE_DIODE_MODEL
@@ -212,6 +234,22 @@ class SpectrometerServer(DeviceServer):
                 tsys = N_CHANS * data_off.mean() / power_gain
                 products['gain'][pol_index, receptor_index] = voltage_gain
                 products['tsys'][pol_index, receptor_index] = tsys
+                tck = interpolate.splrep(chans, delta, 1. / std_delta,
+                                         k=SPLINE_ORDER, t=self._knots)
+                coefs = tck[1][:n_coefs]
+                products['nd_power'][pol_index, receptor_index] = coefs
+            else:
+                revh, imvh = delta
+                std_revh, std_imvh = std_delta
+                vh_phase = np.arctan2(imvh, revh)
+                # A rough estimate of the phase stdev using the VH mean as
+                # the radius of the phase angle
+                std_vh_phase = (np.sqrt(std_revh ** 2 + std_imvh ** 2) /
+                                np.sqrt(revh ** 2 + imvh ** 2))
+                tck = interpolate.splrep(chans, vh_phase, 1. / std_vh_phase,
+                                         k=SPLINE_ORDER, t=self._knots)
+                coefs = tck[1][:n_coefs]
+                products['nd_phase'][receptor_index] = coefs
         l0_timestamp = self._l0_dump_end - 0.5 * self._l0_int_time
         for key, value in products.items():
             self._telstate.add(key, value, l0_timestamp)

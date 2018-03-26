@@ -30,6 +30,7 @@ setup(
         'katsdptelstate',
         'katsdpservices',
         'numpy',
+        'scipy',
         'spead2',
     ],
     use_katversion=True
