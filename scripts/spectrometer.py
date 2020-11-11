@@ -119,7 +119,7 @@ class SpectrometerServer(DeviceServer):
         self._output_stream_name = output_stream_name
         self._telstate = telstate.view(output_stream_name)
         # XXX Hack to get relevant digitiser timestamp metadata
-        self._dig_time_scale = self._telstate['i0_scale_factor_timestamp']
+        self._dig_time_scale = self._telstate['wide_scale_factor_timestamp']
         self._l0_int_time = telstate.view(l0_stream_name)['int_time']
         self._l0_dump_end = None
         # Generate uniform sequence of knots across spectrum for spline fits
@@ -160,14 +160,14 @@ class SpectrometerServer(DeviceServer):
             spead2.ThreadPool(), max_heaps=20 * n_heaps_per_dump,
             ring_heaps=20 * n_heaps_per_dump, contiguous_only=False)
         n_memory_buffers = 80 * n_heaps_per_dump
-        heap_size = 2 * N_CHANS * 4 + 64
+        heap_size = 2 * N_CHANS * 4 + 72
         memory_pool = spead2.MemoryPool(heap_size, heap_size + 4096,
                                         n_memory_buffers, n_memory_buffers)
         self.rx.set_memory_pool(memory_pool)
         interface_address = katsdpservices.get_interface_address(input_interface)
         for stream in self._streams.values():
             endpoint = katsdptelstate.endpoint.endpoint_parser(7150)(stream)
-            for port_offset in range(4):
+            for port_offset in range(1):
                 if interface_address is not None:
                     self.rx.add_udp_reader(
                         endpoint.host, endpoint.port + port_offset,
@@ -270,7 +270,7 @@ class SpectrometerServer(DeviceServer):
         chans = channel_ordering(N_CHANS)
         heaps = {}
         # XXX Hack to get relevant digitiser timestamp metadata
-        dig_sync_time = self._telstate['i0_sync_time']
+        dig_sync_time = self._telstate['wide_sync_time']
         while True:
             try:
                 heap = await self.rx.get()
