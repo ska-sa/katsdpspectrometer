@@ -57,7 +57,7 @@ class Status(enum.Enum):
     FINISHED = 4
 
 
-HeapData = namedtuple('HeapData', 'timestamp nd_on dig_serial data')
+HeapData = namedtuple('HeapData', 'timestamp nd_on dig_serial n_accs data')
 
 
 def warn_if_positive(value):
@@ -107,6 +107,30 @@ def unpack_bits(x, partition):
     return out[::-1]    # Put back into MSB-to-LSB order
 
 
+def cbf_telstate_view(telstate, l0_stream):
+    """Create a telstate view that allows querying properties of CBF streams.
+
+    This starts with the parent stream of the main SDP stream (typically
+    `baseline-correlation-products`). Properties that don't exist on that CBF
+    stream are searched on the upstream `antenna-channelised-voltage` stream,
+    and then the CBF instrument of that stream.
+
+    Parameters
+    ----------
+    telstate : :class:`katsdptelstate.TelescopeState`
+        Telstate view on main SDP stream
+
+    Returns
+    -------
+    view : :class:`katsdptelstate.TelescopeState`
+        Telstate view that allows CBF stream properties to be searched
+    """
+    x_stream = telstate.view(l0_stream, exclusive=True)['src_streams'][0]
+    f_stream = telstate.view(x_stream, exclusive=True)['src_streams'][0]
+    instrument = telstate.view(f_stream, exclusive=True)['instrument_dev_name']
+    return telstate.view(instrument, exclusive=True).view(f_stream).view(x_stream)
+
+
 class SpectrometerServer(DeviceServer):
     VERSION = 'sdp-spectrometer-0.1'
     BUILD_STATE = 'katsdpspectrometer-' + katsdpspectrometer.__version__
@@ -118,8 +142,9 @@ class SpectrometerServer(DeviceServer):
         self._l0_stream_name = l0_stream_name
         self._output_stream_name = output_stream_name
         self._telstate = telstate.view(output_stream_name)
-        # XXX Hack to get relevant digitiser timestamp metadata
-        self._dig_time_scale = self._telstate['wide_scale_factor_timestamp']
+        cbf_telstate = cbf_telstate_view(telstate, l0_stream_name)
+        self._dig_sync_time = cbf_telstate['sync_time']
+        self._dig_time_scale = cbf_telstate['scale_factor_timestamp']
         self._l0_int_time = telstate.view(l0_stream_name)['int_time']
         self._l0_dump_end = None
         # Generate uniform sequence of knots across spectrum for spline fits
@@ -216,18 +241,22 @@ class SpectrometerServer(DeviceServer):
                 continue
             timestamps = np.array([heap.timestamp for heap in dump_heaps])
             nd_on = np.array([heap.nd_on for heap in dump_heaps])
+            n_accs = np.array([heap.n_accs for heap in dump_heaps])
             data = np.vstack([heap.data[np.newaxis] for heap in dump_heaps])
             on = np.where(nd_on == 1)[0]
             off = np.where(nd_on == 0)[0]
             if min(len(on), len(off)) < 8:
                 continue
-            intervals = np.r_[np.diff(timestamps), np.inf]
-            on_time = min(intervals[on])
-            off_time = min(intervals[off])
-            on_accums = on_time * self._dig_time_scale / (2. * N_CHANS)
-            off_accums = off_time * self._dig_time_scale / (2. * N_CHANS)
-            data_on = data[on] / on_accums
-            data_off = data[off] / off_accums
+            # intervals = np.r_[np.diff(timestamps), np.inf]
+            # on_time = min(intervals[on])
+            # off_time = min(intervals[off])
+            # on_accums = on_time * self._dig_time_scale / (2. * N_CHANS)
+            # off_accums = off_time * self._dig_time_scale / (2. * N_CHANS)
+            broadcast = (slice(None),) + (data.ndim - 1) * (np.newaxis,)
+            logger.info('n_accs[on]:  %s', n_accs[on][:4])
+            logger.info('n_accs[off]: %s', n_accs[off][:4])
+            data_on = data[on] / n_accs[on][broadcast]
+            data_off = data[off] / n_accs[off][broadcast]
             delta = data_on.mean(axis=0) - data_off.mean(axis=0)
             std_delta = np.sqrt(data_on.var(axis=0) + data_off.var(axis=0))
             if stream in ('hh', 'vv'):
@@ -269,8 +298,6 @@ class SpectrometerServer(DeviceServer):
         no_heaps_yet = True
         chans = channel_ordering(N_CHANS)
         heaps = {}
-        # XXX Hack to get relevant digitiser timestamp metadata
-        dig_sync_time = self._telstate['wide_sync_time']
         while True:
             try:
                 heap = await self.rx.get()
@@ -292,12 +319,13 @@ class SpectrometerServer(DeviceServer):
                 continue
             # Extract the relevant items from spectrometer heap
             adc_timestamp = int(ig['timestamp'].value)
-            timestamp = dig_sync_time + adc_timestamp / self._dig_time_scale
+            timestamp = self._dig_sync_time + adc_timestamp / self._dig_time_scale
             dig_id = int(ig['digitiser_id'].value)
             dig_status = int(ig['digitiser_status'].value)
             id_fields = unpack_bits(dig_id, (24, 8, 14, 2))
             dig_serial, dig_type, receptor_number, pol = id_fields
             saturation, nd_on = unpack_bits(dig_status, (8, 1))
+            n_accs = int(ig['n_accs'].value)
             stream = [s[5:] for s in new_items if s.startswith('data_')][0]
             if stream == 'vh':
                 revh = ig['data_' + stream].value[:N_CHANS][chans]
@@ -308,7 +336,7 @@ class SpectrometerServer(DeviceServer):
             # Put new heap onto the queue of recent heaps
             key = (receptor_number, stream)
             stream_heaps = heaps.get(key, [])
-            stream_heaps.append(HeapData(timestamp, nd_on, dig_serial, data))
+            stream_heaps.append(HeapData(timestamp, nd_on, dig_serial, n_accs, data))
             heaps[key] = stream_heaps
             # While not capturing correlator data, keep sliding window of heaps
             if self._l0_dump_end is None:
@@ -328,11 +356,9 @@ class SpectrometerServer(DeviceServer):
 
     async def request_capture_init(self, ctx, capture_block_id: str) -> None:
         """Start a capture block, triggering spectrometer output to telstate."""
-        output_capture_stream = self._telstate.SEPARATOR.join(
-            (capture_block_id, self._output_stream_name))
+        output_capture_stream = self._telstate.join(capture_block_id, self._output_stream_name)
         self._telstate = self._telstate.view(output_capture_stream)
-        l0_capture_stream = self._telstate.SEPARATOR.join(
-            (capture_block_id, self._l0_stream_name))
+        l0_capture_stream = self._telstate.join(capture_block_id, self._l0_stream_name)
         l0_telstate = self._telstate.view(self._l0_stream_name)
         cb_l0_telstate = self._telstate.view(l0_capture_stream)
         self._l0_dump_end = (l0_telstate['sync_time'] +
