@@ -136,11 +136,13 @@ class SpectrometerServer(DeviceServer):
     BUILD_STATE = 'katsdpspectrometer-' + katsdpspectrometer.__version__
 
     def __init__(self, host, port, loop, input_streams, input_interface,
-                 telstate, l0_stream_name, output_stream_name):
+                 telstate, l0_stream_name, output_stream_name, capture_heaps):
         super().__init__(host, port, loop=loop)
         self._streams = input_streams
+        self._receptors = sorted(self._streams)
         self._l0_stream_name = l0_stream_name
         self._output_stream_name = output_stream_name
+        self._heap_receptors = capture_heaps.split(',')
         self._telstate = telstate.view(output_stream_name)
         cbf_telstate = cbf_telstate_view(telstate, l0_stream_name)
         self._dig_sync_time = cbf_telstate['sync_time']
@@ -203,7 +205,7 @@ class SpectrometerServer(DeviceServer):
                                            bind_hostname=endpoint.host,
                                            buffer_size=heap_size + 4096)
         # Put stream metadata into telstate in the top-level stream namespace
-        self._telstate.add('receptors', sorted(self._streams), immutable=True)
+        self._telstate.add('receptors', self._receptors, immutable=True)
         self._telstate.add('pols', POL_ORDERING, immutable=True)
         self._telstate.add('n_chans', N_CHANS, immutable=True)
         self._telstate.add('knots', self._knots, immutable=True)
@@ -218,8 +220,8 @@ class SpectrometerServer(DeviceServer):
         logger.info('Dump %.3f, %d streams, %d heaps', l0_timestamp,
                     len(heaps), sum([len(v) for v in heaps.values()]))
         receptor_lookup = {int(rcp_name[1:]): n
-                           for n, rcp_name in enumerate(sorted(self._streams))}
-        n_receptors = len(receptor_lookup)
+                           for n, rcp_name in enumerate(self._receptors)}
+        n_receptors = len(self._receptors)
         n_pols = len(POL_ORDERING)
         n_coefs = len(self._knots) + SPLINE_ORDER + 1
         products = {'gain': np.full((n_pols, n_receptors), np.nan),
@@ -243,6 +245,16 @@ class SpectrometerServer(DeviceServer):
             nd_on = np.array([heap.nd_on for heap in dump_heaps])
             n_accs = np.array([heap.n_accs for heap in dump_heaps])
             data = np.vstack([heap.data[np.newaxis] for heap in dump_heaps])
+            rcp_name = self._receptors[receptor_index]
+            if rcp_name in self._heap_receptors:
+                self._telstate.add('heap_{}_{}_timestamps'.format(rcp_name, stream),
+                                   timestamps, l0_timestamp)
+                self._telstate.add('heap_{}_{}_nd_on'.format(rcp_name, stream),
+                                   nd_on, l0_timestamp)
+                self._telstate.add('heap_{}_{}_n_accs'.format(rcp_name, stream),
+                                   n_accs, l0_timestamp)
+                self._telstate.add('heap_{}_{}_data'.format(rcp_name, stream),
+                                   data, l0_timestamp)
             on = np.where(nd_on == 1)[0]
             off = np.where(nd_on == 0)[0]
             if min(len(on), len(off)) < 8:
@@ -406,6 +418,8 @@ if __name__ == '__main__':
     parser.add_argument('--output-stream-name', default='sdp_spectrometer',
                         help='Telstate name of the spectrometer output stream',
                         metavar='NAME')
+    parser.add_argument('--capture-heaps', default='', metavar='RECEPTORS',
+                        help='Capture raw SPEAD heaps of the listed receptors')
     parser.add_argument('-p', '--port', type=int, default=2045, metavar='N',
                         help='KATCP host port [default=%(default)s]')
     parser.add_argument('-a', '--host', default='', metavar='HOST',
@@ -415,7 +429,8 @@ if __name__ == '__main__':
     loop = asyncio.get_event_loop()
     server = SpectrometerServer(args.host, args.port, loop, args.input_streams,
                                 args.input_interface, args.telstate,
-                                args.l0_stream_name, args.output_stream_name)
+                                args.l0_stream_name, args.output_stream_name,
+                                args.capture_heaps)
     logger.info("Started digitiser spectrometer server")
     loop.run_until_complete(run(loop, server))
     loop.close()
