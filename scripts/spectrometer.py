@@ -209,9 +209,8 @@ class SpectrometerServer(DeviceServer):
         self._telstate.add('pols', POL_ORDERING, immutable=True)
         self._telstate.add('n_chans', N_CHANS, immutable=True)
         self._telstate.add('knots', self._knots, immutable=True)
-        # XXX What do you mean it's not L-band???
-        self._telstate.add('center_freq', 1284e6, immutable=True)
-        self._telstate.add('bandwidth', 856e6, immutable=True)
+        self._telstate.add('center_freq', cbf_telstate['center_freq'], immutable=True)
+        self._telstate.add('bandwidth', cbf_telstate['bandwidth'], immutable=True)
 
     def process_l0_dump(self, heaps):
         """Turn an L0 dump worth of heaps into spectrometer products."""
