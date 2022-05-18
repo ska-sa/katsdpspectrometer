@@ -258,11 +258,6 @@ class SpectrometerServer(DeviceServer):
             off = np.where(nd_on == 0)[0]
             if min(len(on), len(off)) < 8:
                 continue
-            # intervals = np.r_[np.diff(timestamps), np.inf]
-            # on_time = min(intervals[on])
-            # off_time = min(intervals[off])
-            # on_accums = on_time * self._dig_time_scale / (2. * N_CHANS)
-            # off_accums = off_time * self._dig_time_scale / (2. * N_CHANS)
             broadcast = (slice(None),) + (data.ndim - 1) * (np.newaxis,)
             logger.info('n_accs[on]:  %s', n_accs[on][:4])
             logger.info('n_accs[off]: %s', n_accs[off][:4])
