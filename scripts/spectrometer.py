@@ -131,6 +131,35 @@ def cbf_telstate_view(telstate, l0_stream):
     return telstate.view(instrument, exclusive=True).view(f_stream).view(x_stream)
 
 
+def add_spead_descriptors(ig):
+    """Create spectrometer SPEAD descriptors and add to item group `ig`.
+
+    See Table 5 in M1000-0001-053 Rev 6 (L-Band Digitiser - Correlator Beam Former ICD),
+    but ignore the incorrect timestamp ID (it's 0x1600 and not 0x0016).
+    """
+    ig.add_item(id=int('0x1015', 16), name='n_accs',
+                description='The number of spectra that are accumulated per integration',
+                shape=(), format=[('u', 48)])
+    ig.add_item(id=int('0x1600', 16), name='timestamp',
+                description='Local digitiser timestamp at start of accumulation',
+                shape=(), format=[('u', 48)])
+    ig.add_item(id=int('0x3101', 16), name='digitiser_id',
+                description='Digitiser serial number, type, receptor ID, pol ID',
+                shape=(), format=[('u', 48)])
+    ig.add_item(id=int('0x3102', 16), name='digitiser_status',
+                description='Accumulator / FFT / ADC saturation, noise diode status',
+                shape=(), format=[('u', 48)])
+    ig.add_item(id=int('0x3301', 16), name='data_vv',
+                description='Autocorrelation VV*',
+                shape=(N_CHANS,), dtype='>u4')
+    ig.add_item(id=int('0x3302', 16), name='data_hh',
+                description='Autocorrelation HH*',
+                shape=(N_CHANS,), dtype='>u4')
+    ig.add_item(id=int('0x3303', 16), name='data_vh',
+                description='Crosscorrelation VH* (real followed by imag)',
+                shape=(2 * N_CHANS,), dtype='>i4')
+
+
 class SpectrometerServer(DeviceServer):
     VERSION = 'sdp-spectrometer-0.1'
     BUILD_STATE = 'katsdpspectrometer-' + katsdpspectrometer.__version__
@@ -301,6 +330,7 @@ class SpectrometerServer(DeviceServer):
         self._status_sensor.set_value(Status.WAIT_DATA)
         logger.info('Waiting for data...')
         ig = spead2.ItemGroup()
+        add_spead_descriptors(ig)
         no_heaps_yet = True
         chans = channel_ordering(N_CHANS)
         heaps = {}
